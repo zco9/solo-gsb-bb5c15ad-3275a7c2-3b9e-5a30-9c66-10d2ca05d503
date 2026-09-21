@@ -242,41 +242,110 @@ def test_stage2_full_but_cumulative_count_still_between_numbers_is_pending():
     assert entry["decision"] == "pending"
 
 
-def test_stage1_acceptance_is_not_overwritten_by_stage_two():
-    samples = good_stage1() + [
-        sample("S6", "3103002500", stage=2),
-        sample("S7", "3103002500", stage=2),
-        sample("S8", "3103002500", stage=2),
-        sample("S9", "3103002500", stage=2),
-        sample("S10", "3103002500", stage=2),
-    ]
+# ------------------------------------------- stage-2 samples after a verdict
+
+
+def test_stage2_sample_after_stage1_acceptance_is_rejected():
+    samples = good_stage1() + [sample("S6", "3103002500", stage=2)]
     resp = audit([plan()], samples)
-    entry = resp.json()["plans"][0]
-    assert entry["stage1_defects"] == 0
-    assert entry["stage2_defects"] == 5
-    assert entry["total_defects"] == 5
-    assert entry["decision"] == "accept"  # stage-1 verdict stands
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"]["error"] == "STAGE_AFTER_DECISION"
+    assert detail["sample_index"] == 5
+    assert detail["plan_index"] == 0
+    assert "accept" in detail["error"]["message"]
 
 
-def test_stage1_rejection_is_not_overwritten_by_stage_two():
+def test_stage2_sample_after_stage1_rejection_is_rejected():
     samples = [
         sample("S1", "3103002500"),
         sample("S2", "3103002500"),
         sample("S3", "3103002000"),
         sample("S4", "3103002000"),
         sample("S5", "3103002000"),
-    ] + [
         sample("S6", "3103002000", stage=2),
-        sample("S7", "3103002000", stage=2),
-        sample("S8", "3103002000", stage=2),
-        sample("S9", "3103002000", stage=2),
-        sample("S10", "3103002000", stage=2),
     ]
     resp = audit([plan()], samples)
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"]["error"] == "STAGE_AFTER_DECISION"
+    assert detail["sample_index"] == 5
+    assert detail["plan_index"] == 0
+    assert "reject" in detail["error"]["message"]
+
+
+def test_stage_after_decision_payload_names_expected_and_actual_stage():
+    samples = good_stage1() + [sample("S6", "3103002000", stage=2)]
+    resp = audit([plan()], samples)
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["sample_index"] == 5
+    assert detail["plan_index"] == 0
+    error = detail["error"]
+    assert error["error"] == "STAGE_AFTER_DECISION"
+    assert "stage-2" in error["expected"]
+    assert "stage-1" in error["expected"]
+    assert error["found"] == "stage 2 sample"
+
+
+def test_first_offending_stage2_sample_after_decision_is_reported():
+    samples = good_stage1() + [
+        sample("S6", "3103002000", stage=2),
+        sample("S7", "3103002000", stage=2),
+    ]
+    resp = audit([plan()], samples)
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"]["error"] == "STAGE_AFTER_DECISION"
+    assert detail["sample_index"] == 5  # the first offender, not a later one
+
+
+def test_stage_after_decision_locates_the_decided_plan_only():
+    other = plan(
+        gtin=GTIN_PRODUCT,
+        batch="B2",
+        min_weight="0",
+        max_weight="99",
+        n1=2,
+        a1=0,
+        r1=2,
+        n2=4,
+        a2=1,
+        r2=2,
+    )
+    samples = good_stage1() + [
+        sample("X1", "3103002000", gtin=GTIN_PRODUCT, batch="B2"),
+        sample("X2", "3103999999", gtin=GTIN_PRODUCT, batch="B2"),  # 1 defect
+    ]
+    # The inconclusive plan still accepts stage-2 samples ...
+    resp = audit(
+        [plan(), other],
+        samples
+        + [sample("X3", "3103002000", stage=2, gtin=GTIN_PRODUCT, batch="B2")],
+    )
+    assert resp.status_code == 200
+    entries = resp.json()["plans"]
+    assert entries[1]["stage2_count"] == 1
+    assert entries[1]["decision"] == "pending"
+
+    # ... while a stage-2 sample for the already-accepted plan is rejected.
+    resp = audit([plan(), other], samples + [sample("S6", "3103002000", stage=2)])
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"]["error"] == "STAGE_AFTER_DECISION"
+    assert detail["sample_index"] == 7
+    assert detail["plan_index"] == 0
+
+
+def test_stage2_sample_before_stage1_completes_is_still_counted_as_pending():
+    samples = good_stage1(count=3) + [sample("S9", "3103002000", stage=2)]
+    resp = audit([plan()], samples)
+    assert resp.status_code == 200
     entry = resp.json()["plans"][0]
-    assert entry["stage1_defects"] == 2
-    assert entry["total_defects"] == 2
-    assert entry["decision"] == "reject"  # stage-1 verdict stands
+    assert entry["stage1_count"] == 3
+    assert entry["stage2_count"] == 1
+    assert entry["total_count"] == 4
+    assert entry["decision"] == "pending"
 
 
 # ------------------------------------------------------------- interval rules
@@ -502,7 +571,9 @@ def test_stage_one_overflow_is_rejected_at_the_offending_sample():
 
 def test_stage_two_overflow_is_rejected_at_the_offending_sample():
     # Capacity of stage 2 is n2 - n1 = 5; the 6th stage-2 sample overflows.
-    samples = good_stage1() + [
+    # Stage 1 must be inconclusive here: after a final stage-1 verdict the
+    # stage-2 samples would be rejected with STAGE_AFTER_DECISION first.
+    samples = continuing_samples() + [
         sample(f"S{i}", "3103002000", stage=2) for i in range(6, 12)
     ]
     resp = audit([plan()], samples)

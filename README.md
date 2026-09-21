@@ -996,8 +996,14 @@ curl -X POST http://localhost:8080/packing-audit \
     计划，`sample_index` 定位样本；
   - **阶段样本超额**（`STAGE_OVERFLOW`）：同一计划最多 `n1` 个一阶段样本、
     `n2 - n1` 个二阶段样本（两阶段合计不超过 `n2`），超出的样本触发 `422`，
-    `sample_index` 定位该样本、`plan_index` 定位所属计划。
-- 判定规则（每个计划独立；一阶段结论一旦成立即为**最终结论，二阶段不得改写**）：
+    `sample_index` 定位该样本、`plan_index` 定位所属计划；
+  - **定论后抽样**（`STAGE_AFTER_DECISION`）：某计划一阶段抽满 `n1` 且缺陷数已
+    触发 `a1`/`r1`（决策已为 accept/reject）后，该计划抽样即终止；此后任何仍
+    标记 `stage=2` 的样本立即触发 `422`，不计入 `stage2`/`total` 等任何计数。
+    `sample_index` 定位该样本、`plan_index` 定位所属计划，`expected`/`found`
+    分别给出期望与实际阶段。
+- 判定规则（每个计划独立；一阶段结论一旦成立即为**最终结论**：该计划抽样立即
+  终止，之后到达的 `stage=2` 样本按 `STAGE_AFTER_DECISION` 整单拒绝）：
   1. 一阶段抽满 `n1` 件后：缺陷数 `≤ a1` → **接收（accept）**；`≥ r1` → **拒收
      （reject）**；介于两者之间（严格大于 `a1` 且严格小于 `r1`）则进入二阶段；
   2. 仅当两阶段**累计抽满 `n2` 件**时，才按累计缺陷数对照 `a2/r2`：`≤ a2` 接收、
@@ -1053,11 +1059,29 @@ curl -X POST http://localhost:8080/weight-sampling-audit \
 }
 ```
 
-一阶段抽满即定论时结论不可改写：例如一阶段 5 件中 0 个缺陷已接收，之后再抽二阶段
-样本（即使全部越界），`decision` 仍为 `"accept"`，二阶段计数照常体现在响应中。
-一阶段未满 `n1`、或一阶段未定论而累计未满 `n2` 时 `decision` 为 `"pending"`；
-抽满 `n2` 但累计缺陷数仍严格介于 `a2` 与 `r2` 之间（如 `a2=1, r2=3` 时累计 2 个
-缺陷）同样保持 `"pending"`。
+一阶段抽满即定论时抽样终止：例如一阶段 5 件中 0 个缺陷已接收（或缺陷数达到
+`r1` 已拒收），此后任何仍标记 `stage=2` 的样本都返回 `422 STAGE_AFTER_DECISION`，
+不计入任何计数。一阶段未满 `n1`、或一阶段未定论而累计未满 `n2` 时 `decision`
+为 `"pending"`；抽满 `n2` 但累计缺陷数仍严格介于 `a2` 与 `r2` 之间（如
+`a2=1, r2=3` 时累计 2 个缺陷）同样保持 `"pending"`。
+
+一阶段已定论后仍提交二阶段样本返回 `422`，期望与实际阶段一并给出（下例为一阶段
+0 缺陷已接收后，第 6 个样本仍标记 `stage=2`）：
+
+```json
+{
+  "detail": {
+    "sample_index": 5,
+    "plan_index": 0,
+    "error": {
+      "error": "STAGE_AFTER_DECISION",
+      "message": "sample 5: plan 0 (GTIN '09501101530003' batch 'B1') already reached its final decision 'accept' at stage 1; a stage-2 sample may not be drawn afterwards",
+      "expected": "no stage-2 samples after the final stage-1 decision 'accept'",
+      "found": "stage 2 sample"
+    }
+  }
+}
+```
 
 阶段样本超额返回 `422`，定位到越额样本与其所属计划（下例为第 6 个一阶段样本，
 一阶段容量为 5）：
@@ -1170,7 +1194,7 @@ app/
   traceaudit.py # 追溯事件审计：GTIN+序列号实物识别、批号/效期一致性校验、receive→pick→ship 状态机与异常记录、最终状态汇总
   genealogy.py # 生产批次谱系审计：GTIN+批号批次台账、一批一产/无来源/循环依赖图校验、稳定拓扑序库存扣减与超耗拒绝、批次最终余量
   packing.py  # 装箱装载审计：容器森林校验（重复容器/未知父容器/环）、GTIN+序列号重复装载检测、叶到根直属与递归重量/货品数汇总、over_limit 超重标记
-  sampling.py # 批次重量双重抽样验收：GTIN+批号计划（闭区间 + n1/a1/r1/n2/a2/r2 阈值校验）、样本唯一 01/10/21/重量 AI 校验与 GTIN+序列号去重、阶段容量与匹配计划校验、一阶段定论优先的 accept/reject/pending 判定
+  sampling.py # 批次重量双重抽样验收：GTIN+批号计划（闭区间 + n1/a1/r1/n2/a2/r2 阈值校验）、样本唯一 01/10/21/重量 AI 校验与 GTIN+序列号去重、阶段容量与匹配计划校验、一阶段定论即终止抽样（后续 stage=2 样本 422）的 accept/reject/pending 判定
 tests/
   test_parse.py
   test_ai_registry.py       # 不可变注册表：启动期声明校验、只读性与共享识别器（完整键/最长匹配）
