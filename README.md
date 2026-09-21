@@ -996,10 +996,19 @@ curl -X POST http://localhost:8080/packing-audit \
     计划，`sample_index` 定位样本；
   - **阶段样本超额**（`STAGE_OVERFLOW`）：同一计划最多 `n1` 个一阶段样本、
     `n2 - n1` 个二阶段样本（两阶段合计不超过 `n2`），超出的样本触发 `422`，
-    `sample_index` 定位该样本、`plan_index` 定位所属计划。
+    `sample_index` 定位该样本、`plan_index` 定位所属计划；
+  - **定论后再抽二阶段**（`STAGE_AFTER_DECISION`）：一阶段抽满 `n1` 件且缺陷数
+    已 `≤ a1`（接收）或 `≥ r1`（拒收）后，该计划即**终局定论、抽样终止**；此后
+    任何仍标记 `stage=2` 的样本一律立即 `422` 拒绝——**不计入** `stage2_count` /
+    `total_count` 等任何计数，也不改变响应中的判定。错误给出 `sample_index`、
+    `plan_index`、`expected_stage`（`1`）、`found_stage`（`2`）与定论时的
+    `decision`（`"accept"` / `"reject"`）。注意：一阶段**未满** `n1`，或虽抽满但
+    缺陷数严格介于 `a1` 与 `r1` 之间（未定论）时，二阶段样本仍是合法的继续抽样。
 - 判定规则（每个计划独立；一阶段结论一旦成立即为**最终结论，二阶段不得改写**）：
   1. 一阶段抽满 `n1` 件后：缺陷数 `≤ a1` → **接收（accept）**；`≥ r1` → **拒收
-     （reject）**；介于两者之间（严格大于 `a1` 且严格小于 `r1`）则进入二阶段；
+     （reject）**；介于两者之间（严格大于 `a1` 且严格小于 `r1`）则进入二阶段。
+     接收/拒收一旦成立即为该计划的**终局**，抽样立即终止，其后任何 `stage=2`
+     样本返回 `422 STAGE_AFTER_DECISION` 且不计数（见上）；
   2. 仅当两阶段**累计抽满 `n2` 件**时，才按累计缺陷数对照 `a2/r2`：`≤ a2` 接收、
      `≥ r2` 拒收；累计数仍严格介于 `a2` 与 `r2` 之间时保持 `pending`；
   3. 一阶段未满 `n1`，或一阶段未定论且二阶段累计未满 `n2`，决定均为
@@ -1053,11 +1062,42 @@ curl -X POST http://localhost:8080/weight-sampling-audit \
 }
 ```
 
-一阶段抽满即定论时结论不可改写：例如一阶段 5 件中 0 个缺陷已接收，之后再抽二阶段
-样本（即使全部越界），`decision` 仍为 `"accept"`，二阶段计数照常体现在响应中。
-一阶段未满 `n1`、或一阶段未定论而累计未满 `n2` 时 `decision` 为 `"pending"`；
-抽满 `n2` 但累计缺陷数仍严格介于 `a2` 与 `r2` 之间（如 `a2=1, r2=3` 时累计 2 个
-缺陷）同样保持 `"pending"`。
+一阶段抽满即定论时抽样终止：例如一阶段 5 件中 0 个缺陷已接收，之后再提交
+`stage=2` 样本（即使全部越界）会被**整单拒绝**，返回 `422 STAGE_AFTER_DECISION`，
+这些样本不计入 `stage2_count` / `total_count`，合法前缀（5 件一阶段）本身的响应
+仍为 `decision: "accept"`、二阶段各项为零。一阶段拒收同理。一阶段未满 `n1`、或
+一阶段未定论而累计未满 `n2` 时 `decision` 为 `"pending"`；抽满 `n2` 但累计缺陷数
+仍严格介于 `a2` 与 `r2` 之间（如 `a2=1, r2=3` 时累计 2 个缺陷）同样保持
+`"pending"`。
+
+定论后再抽二阶段返回 `422`（下例为一阶段 5 件全部合格、计划已接收后，第 6 个
+样本仍标记 `stage=2`；`sample_index=5`、`plan_index=0`，并给出期望/实际阶段）：
+
+```bash
+curl -X POST http://localhost:8080/weight-sampling-audit \
+  -H "Content-Type: application/json" \
+  -d '{"target_unit": "kg", "plans": [{"gtin": "09501101530003", "batch": "B1", "min_weight": 1.9, "max_weight": 2.1, "n1": 5, "a1": 0, "r1": 2, "n2": 10, "a2": 1, "r2": 2}], "samples": [{"stage": 1, "scan": "010950110153000310B1\u001d21SN01\u001d3103002000"}, {"stage": 1, "scan": "010950110153000310B1\u001d21SN02\u001d3103002000"}, {"stage": 1, "scan": "010950110153000310B1\u001d21SN03\u001d3103002000"}, {"stage": 1, "scan": "010950110153000310B1\u001d21SN04\u001d3103002000"}, {"stage": 1, "scan": "010950110153000310B1\u001d21SN05\u001d3103002000"}, {"stage": 2, "scan": "010950110153000310B1\u001d21SN06\u001d3103002500"}]}'
+```
+
+```json
+{
+  "detail": {
+    "sample_index": 5,
+    "plan_index": 0,
+    "error": {
+      "error": "STAGE_AFTER_DECISION",
+      "message": "sample 5: plan 0 (GTIN '09501101530003' batch 'B1') already reached a final stage-1 decision of 'accept' after 5 samples; no further samples may be drawn for a decided plan",
+      "expected": "no further samples after a final stage-1 decision",
+      "expected_stage": 1,
+      "found_stage": 2,
+      "decision": "accept"
+    }
+  }
+}
+```
+
+若一阶段只有 1 个缺陷（严格介于 `a1=0` 与 `r1=2` 之间、未定论），同样的二阶段
+样本则是**合法的继续抽样**：请求随其余二阶段样本正常返回 `200`，不会产生该错误。
 
 阶段样本超额返回 `422`，定位到越额样本与其所属计划（下例为第 6 个一阶段样本，
 一阶段容量为 5）：
@@ -1170,7 +1210,7 @@ app/
   traceaudit.py # 追溯事件审计：GTIN+序列号实物识别、批号/效期一致性校验、receive→pick→ship 状态机与异常记录、最终状态汇总
   genealogy.py # 生产批次谱系审计：GTIN+批号批次台账、一批一产/无来源/循环依赖图校验、稳定拓扑序库存扣减与超耗拒绝、批次最终余量
   packing.py  # 装箱装载审计：容器森林校验（重复容器/未知父容器/环）、GTIN+序列号重复装载检测、叶到根直属与递归重量/货品数汇总、over_limit 超重标记
-  sampling.py # 批次重量双重抽样验收：GTIN+批号计划（闭区间 + n1/a1/r1/n2/a2/r2 阈值校验）、样本唯一 01/10/21/重量 AI 校验与 GTIN+序列号去重、阶段容量与匹配计划校验、一阶段定论优先的 accept/reject/pending 判定
+  sampling.py # 批次重量双重抽样验收：GTIN+批号计划（闭区间 + n1/a1/r1/n2/a2/r2 阈值校验）、样本唯一 01/10/21/重量 AI 校验与 GTIN+序列号去重、阶段容量、匹配计划与定论后终止（STAGE_AFTER_DECISION）校验、一阶段定论终局不可改写的 accept/reject/pending 判定
 tests/
   test_parse.py
   test_ai_registry.py       # 不可变注册表：启动期声明校验、只读性与共享识别器（完整键/最长匹配）

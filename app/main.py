@@ -854,7 +854,12 @@ class WeightSample(BaseModel):
 
     stage: Literal[1, 2] = Field(
         ...,
-        description="Sampling stage the item was drawn for: 1 (first stage) or 2 (second stage).",
+        description=(
+            "Sampling stage the item was drawn for: 1 (first stage) or 2 "
+            "(second stage). A stage-2 sample is rejected with 422 "
+            "STAGE_AFTER_DECISION once the plan's full stage 1 already "
+            "accepted or rejected the batch."
+        ),
         examples=[1],
     )
     scan: str = Field(

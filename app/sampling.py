@@ -3,6 +3,13 @@
 The request carries ``target_unit``, a list of acceptance *plans* keyed
 by (GTIN, batch/lot) and a list of drawn *samples* in inspection order;
 every sample names a sampling ``stage`` (1 or 2) and a raw GS1 scan.
+Once the full first stage of a plan is drawn and its verdict is final
+(``defects <= a1`` accepts or ``defects >= r1`` rejects), any further
+sample that still names ``stage=2`` is structurally impossible: it is
+rejected immediately with ``STAGE_AFTER_DECISION`` at the offending
+``sample_index`` (and ``plan_index``), without being counted in any
+stage or altering the response -- the verdict must stay final rather
+than merely tolerating stray stage-2 draws.
 
 Each plan declares the **closed** per-item weight interval
 ``[min_weight, max_weight]`` expressed in ``target_unit`` together with
@@ -30,7 +37,10 @@ only once across all samples (``DUPLICATE_ITEM``), a sample whose
 GTIN+batch matches no plan fails with ``NO_MATCHING_PLAN``, and a plan
 may receive at most ``n1`` stage-1 samples and at most ``n2 - n1``
 stage-2 samples -- an extra sample fails with ``STAGE_OVERFLOW`` at the
-offending ``sample_index`` (and ``plan_index``).
+offending ``sample_index`` (and ``plan_index``).  A stage-2 sample
+presented to a plan whose stage-1 verdict is already final fails with
+``STAGE_AFTER_DECISION`` at the offending ``sample_index`` (and
+``plan_index``); the sample is never counted.
 
 A converted sample weight strictly outside the closed interval is a
 defect; the interval boundaries themselves are conforming.  The
@@ -38,6 +48,10 @@ acceptance decision per plan is:
 
 * stage 1 full (``n1`` samples): ``defects <= a1`` accepts,
   ``defects >= r1`` rejects, anything in between continues to stage 2;
+* a stage-2 sample is only admissible while stage 1 is still open or
+  its verdict was inconclusive; once stage 1 has accepted or rejected
+  the next stage-2 sample is refused with
+  ``STAGE_AFTER_DECISION`` instead of being tallied;
 * the second stage is judged only once both stages together hold
   ``n2`` samples, on the *cumulative* defect count against ``a2/r2``
   (again ``<= a2`` accepts, ``>= r2`` rejects);
@@ -98,8 +112,9 @@ class SamplingStructureError(Exception):
     """The samples violate the plan structure.
 
     ``detail`` is the complete 422 payload: ``DUPLICATE_ITEM`` (with the
-    first occurrence), ``NO_MATCHING_PLAN`` or ``STAGE_OVERFLOW`` (with
-    ``plan_index``) and the offending ``sample_index``.
+    first occurrence), ``NO_MATCHING_PLAN``, ``STAGE_OVERFLOW`` (with
+    ``plan_index``) or ``STAGE_AFTER_DECISION`` (with ``plan_index`` and
+    the final stage-1 decision) and the offending ``sample_index``.
     """
 
     def __init__(self, detail: dict):
@@ -333,6 +348,50 @@ def _stage_overflow(
     )
 
 
+def _stage1_verdict(state: dict) -> str:
+    """Return the final stage-1 verdict (``accept``/``reject``) or ``""``.
+
+    The empty string covers both an incomplete first stage and an
+    inconclusive one (``a1 < defects < r1``): in either case drawing a
+    stage-2 sample is still legal.
+    """
+    if state["stage1_count"] == state["n1"]:
+        if state["stage1_defects"] <= state["a1"]:
+            return ACCEPT
+        if state["stage1_defects"] >= state["r1"]:
+            return REJECT
+    return ""
+
+
+def _stage_after_decision(
+    sample_index: int,
+    plan_index: int,
+    state: dict,
+    gtin: str,
+    batch: str,
+) -> None:
+    verdict = _stage1_verdict(state)
+    raise SamplingStructureError(
+        {
+            "sample_index": sample_index,
+            "plan_index": plan_index,
+            "error": {
+                "error": "STAGE_AFTER_DECISION",
+                "message": (
+                    f"sample {sample_index}: plan {plan_index} (GTIN '{gtin}' "
+                    f"batch '{batch}') already reached a final stage-1 "
+                    f"decision of '{verdict}' after {state['n1']} samples; "
+                    "no further samples may be drawn for a decided plan"
+                ),
+                "expected": "no further samples after a final stage-1 decision",
+                "expected_stage": 1,
+                "found_stage": 2,
+                "decision": verdict,
+            },
+        }
+    )
+
+
 def _decision(state: dict) -> str:
     """Apply the double-sampling rules to one plan's accumulated counters."""
     n1, a1, r1 = state["n1"], state["a1"], state["r1"]
@@ -453,6 +512,16 @@ def audit(
                 if out_of_range:
                     state["stage1_defects"] += 1
             else:
+                # A final stage-1 verdict closes the plan: a later stage-2
+                # sample is refused outright and must never be tallied.
+                if _stage1_verdict(state):
+                    _stage_after_decision(
+                        sample_index,
+                        plan_index,
+                        state,
+                        gtin,
+                        batch,
+                    )
                 capacity = state["n2"] - state["n1"]
                 if state["stage2_count"] == capacity:
                     _stage_overflow(
